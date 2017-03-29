@@ -26,14 +26,16 @@
 #ifndef lkf_h
 #define lkf_h
 
-struct lkf_node {
-    struct lkf_node* next;
-};
+#include <stddef.h>
 
-struct lkf_list {
+typedef struct lkf_node {
+    struct lkf_node* next;
+} lkf_node;
+
+typedef struct lkf_list {
     struct lkf_node root;
     struct lkf_node** tail;
-};
+} lkf_list;
 
 
 #define LKF_INIT(name) {.root = {NULL}, .tail = &(name.root.next)}
@@ -42,12 +44,14 @@ struct lkf_list name = LKF_INIT(name)
 
 #define INIT_LKF(name) \
 do { \
-    name->root.next = NULL; \
-    name->tail = &(name->root.next); \
+    typeof(name) lkf = name; \
+    lkf->root.next = NULL; \
+    lkf->tail = &(lkf->root.next); \
 } while (0)
 
 static inline void lkf_node_put(struct lkf_list* list, struct lkf_node* node)
 {
+    node->next = NULL;
     struct lkf_node** ptr = __sync_lock_test_and_set(&(list->tail), &(node->next));
     *ptr = node;
 }
@@ -103,5 +107,66 @@ static inline struct lkf_node* lkf_node_next(struct lkf_node* node)
     ptr->next = NULL;
     return ptr;
 }
+
+#ifdef __linux__
+#include <syscall.h>
+#include <unistd.h>
+
+static inline void lkf_node_put_wake(struct lkf_list* list, struct lkf_node* node)
+{
+    node->next = NULL;
+    struct lkf_node** ptr = __sync_lock_test_and_set(&(list->tail), &(node->next));
+    if (ptr == &list->root.next) {
+        while (-1 == syscall(__NR_futex, ptr, FUTEX_WAKE, 1, NULL, NULL, 0));
+    }
+    *ptr = node;
+}
+
+static inline struct lkf_node* lkf_node_get_wait(struct lkf_list* list)
+{
+    struct lkf_node* ptr = __sync_lock_test_and_set(&(list->root.next), NULL);
+    while (ptr == NULL) {
+        syscall(__NR_futex, &list->root.next, FUTEX_WAIT, NULL, NULL, NULL, 0);
+        ptr = __sync_lock_test_and_set(&(list->root.next), NULL);
+    };
+
+    struct lkf_node** last = __sync_lock_test_and_set(&(list->tail), &(list->root.next));
+    *last = ptr;
+    return *last;
+}
+#endif
+
+#if 1
+typedef struct proc_context {
+    struct lkf_list list;
+    int stat;
+} proc_context;
+
+static int proc_enter(struct proc_context* ctx, struct lkf_node* node)
+{
+    lkf_node_put(&ctx->list, node);
+    __sync_synchronize();
+    int n = __sync_bool_compare_and_swap(&ctx->stat, 0, 1);
+    if (n == 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int proc_leave(struct proc_context* ctx)
+{
+    ctx->stat = 0;
+    __sync_synchronize();
+    if (ctx->list.tail == &ctx->list.root.next) {
+        return 0;
+    }
+
+    int n = __sync_bool_compare_and_swap(&ctx->stat, 0, 1);
+    if (n == 0) {
+        return 0;
+    }
+    return -1;
+}
+#endif
 
 #endif
