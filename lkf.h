@@ -19,8 +19,8 @@
  * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
  * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
  * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
- * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE,
- * EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
 #ifndef lkf_h
@@ -37,28 +37,28 @@ typedef struct lkf_list {
     struct lkf_node** tail;
 } lkf_list;
 
+#define LKF_INIT(name)                                                                             \
+    {                                                                                              \
+        .root = {NULL}, .tail = &(name.root.next)                                                  \
+    }
+#define LKF_LIST(name) struct lkf_list name = LKF_INIT(name)
 
-#define LKF_INIT(name) {.root = {NULL}, .tail = &(name.root.next)}
-#define LKF_LIST(name) \
-struct lkf_list name = LKF_INIT(name)
+#define INIT_LKF(name)                                                                             \
+    do {                                                                                           \
+        typeof(name) lkf = name;                                                                   \
+        lkf->root.next = NULL;                                                                     \
+        lkf->tail = &(lkf->root.next);                                                             \
+    } while (0)
 
-#define INIT_LKF(name) \
-do { \
-    typeof(name) lkf = name; \
-    lkf->root.next = NULL; \
-    lkf->tail = &(lkf->root.next); \
-} while (0)
-
-static inline void lkf_node_put(struct lkf_list* list, struct lkf_node* node)
+static inline void lkf_node_put(struct lkf_list* list, struct lkf_node* head, struct lkf_node* tail)
 {
-    node->next = NULL;
-    struct lkf_node** ptr = __sync_lock_test_and_set(&(list->tail), &(node->next));
-    *ptr = node;
+    struct lkf_node** ptr = __atomic_exchange_n(&(list->tail), &(tail->next), __ATOMIC_RELAXED);
+    *ptr = head;
 }
 
 static inline struct lkf_node* lkf_node_get_one(struct lkf_list* list)
 {
-    struct lkf_node* head = __sync_lock_test_and_set(&(list->root.next), NULL);
+    struct lkf_node* head = __atomic_exchange_n(&(list->root.next), NULL, __ATOMIC_RELAXED);
     if (head == NULL) {
         return NULL;
     }
@@ -70,7 +70,9 @@ static inline struct lkf_node* lkf_node_get_one(struct lkf_list* list)
         return head;
     }
 
-    int b = __sync_bool_compare_and_swap(&(list->tail), &(head->next), &(list->root.next));
+    struct lkf_node** nextp = &(head->next);
+    int b = __atomic_compare_exchange_n(&(list->tail), &nextp, &(list->root.next), false,
+                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED);
     if (b) {
         head->next = head;
         return head;
@@ -82,14 +84,15 @@ static inline struct lkf_node* lkf_node_get_one(struct lkf_list* list)
 
 static inline struct lkf_node* lkf_node_get(struct lkf_list* list)
 {
-    struct lkf_node* ptr = __sync_lock_test_and_set(&(list->root.next), NULL);
+    struct lkf_node* ptr = __atomic_exchange_n(&(list->root.next), NULL, __ATOMIC_RELAXED);
     if (ptr == NULL) {
         return NULL;
     }
 
-    struct lkf_node** last = __sync_lock_test_and_set(&(list->tail), &(list->root.next));
+    struct lkf_node** last =
+        __atomic_exchange_n(&(list->tail), &(list->root.next), __ATOMIC_RELAXED);
     *last = ptr;
-    return *last;
+    return (lkf_node*) last;
 }
 
 static inline struct lkf_node* lkf_node_next(struct lkf_node* node)
@@ -108,31 +111,45 @@ static inline struct lkf_node* lkf_node_next(struct lkf_node* node)
     return ptr;
 }
 
+static inline lkf_node* lkf_link(struct lkf_node* node)
+{
+    lkf_node* head = node;
+    lkf_node* tail = nullptr;
+    while (node != NULL) {
+        tail = node;
+        node = node->next;
+    }
+    tail->next = head;
+    return tail;
+}
+
 #ifdef __linux__
-#include <syscall.h>
+#include <linux/futex.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 static inline void lkf_node_put_wake(struct lkf_list* list, struct lkf_node* node)
 {
-    node->next = NULL;
-    struct lkf_node** ptr = __sync_lock_test_and_set(&(list->tail), &(node->next));
+    struct lkf_node** ptr = __atomic_exchange_n(&(list->tail), &(node->next), __ATOMIC_RELAXED);
     if (ptr == &list->root.next) {
-        while (-1 == syscall(__NR_futex, ptr, FUTEX_WAKE, 1, NULL, NULL, 0));
+        while (-1 == syscall(__NR_futex, ptr, FUTEX_WAKE, 1, NULL, NULL, 0))
+            ;
     }
     *ptr = node;
 }
 
 static inline struct lkf_node* lkf_node_get_wait(struct lkf_list* list)
 {
-    struct lkf_node* ptr = __sync_lock_test_and_set(&(list->root.next), NULL);
+    struct lkf_node* ptr = __atomic_exchange_n(&(list->root.next), NULL, __ATOMIC_RELAXED);
     while (ptr == NULL) {
         syscall(__NR_futex, &list->root.next, FUTEX_WAIT, NULL, NULL, NULL, 0);
-        ptr = __sync_lock_test_and_set(&(list->root.next), NULL);
+        ptr = __atomic_exchange_n(&(list->root.next), NULL, __ATOMIC_RELAXED);
     };
 
-    struct lkf_node** last = __sync_lock_test_and_set(&(list->tail), &(list->root.next));
+    struct lkf_node** last =
+        __atomic_exchange_n(&(list->tail), &(list->root.next), __ATOMIC_RELAXED);
     *last = ptr;
-    return *last;
+    return (lkf_node*) last;
 }
 #endif
 
@@ -144,9 +161,11 @@ typedef struct proc_context {
 
 static int proc_enter(struct proc_context* ctx, struct lkf_node* node)
 {
-    lkf_node_put(&ctx->list, node);
-    __sync_synchronize();
-    int n = __sync_bool_compare_and_swap(&ctx->stat, 0, 1);
+    node->next = NULL;
+    lkf_node_put(&ctx->list, node, node);
+    int zero = 0;
+    int n = (int) __atomic_compare_exchange_n(&ctx->stat, &zero, 1, false, __ATOMIC_RELAXED,
+                                              __ATOMIC_RELAXED);
     if (n == 0) {
         return -1;
     }
@@ -156,12 +175,14 @@ static int proc_enter(struct proc_context* ctx, struct lkf_node* node)
 static int proc_leave(struct proc_context* ctx)
 {
     ctx->stat = 0;
-    __sync_synchronize();
+    __atomic_thread_fence(__ATOMIC_ACQ_REL);
     if (ctx->list.tail == &ctx->list.root.next) {
         return 0;
     }
 
-    int n = __sync_bool_compare_and_swap(&ctx->stat, 0, 1);
+    int zero = 0;
+    int n = (int) __atomic_compare_exchange_n(&ctx->stat, &zero, 1, false, __ATOMIC_RELAXED,
+                                              __ATOMIC_RELAXED);
     if (n == 0) {
         return 0;
     }
